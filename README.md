@@ -1,36 +1,133 @@
 # Webhook Lab
 
-把「Webhook 到底送了什麼？」變成可查詢、可重現的事件紀錄。
+**Capture the bytes. Understand the event. Reproduce the delivery.**
 
-以 Python / FastAPI 製作的 Webhook 除錯後端，提供 Swagger 操作介面、SQLite 持久化與 Docker 啟動設定。
+[![Tests](https://github.com/ozof70/webhook-lab/actions/workflows/test.yml/badge.svg)](https://github.com/ozof70/webhook-lab/actions/workflows/test.yml)
+![Python](https://img.shields.io/badge/python-3.13-3776AB)
+![FastAPI](https://img.shields.io/badge/FastAPI-009688)
+![Storage](https://img.shields.io/badge/storage-SQLite_WAL-003B57)
 
-## 功能
+A self-hosted webhook debugging toolkit built with FastAPI, SQLite, and Docker. Capture binary payloads, inspect requests, deduplicate retries, and replay events to named HTTPS targets with persistent delivery audit trails.
 
-- 建立多個接收端點，每個端點有獨立 token；資料庫只保存 token 雜湊。
-- 接收 POST / PUT / PATCH，保留原始 payload bytes、方法、query 與標頭。
-- 管理 API 金鑰驗證、事件分頁、端點篩選與 Base64 原文查詢。
-- 指定已設定的目的地重送；連線失敗、429、5xx 可進行最多三次嘗試，採指數退避。
-- 每次投遞保存狀態碼、錯誤類型、耗時與時間；重新啟動後紀錄仍保留。
-- 預設不跟隨 redirect、不使用環境 proxy、不轉送來源驗證資訊。
-- 1 MiB 串流 payload 上限、非 root Docker、GitHub Actions 自動測試。
+## Why it exists
 
-## Docker 快速啟動
+A webhook failure is often difficult to reproduce: the original bytes disappear into logs, retries create duplicate events, and a manual resend loses its history. Webhook Lab keeps the captured request and every replay attempt together so you can investigate what arrived and what happened next.
+
+## Engineering highlights
+
+| Capability | Implementation |
+| --- | --- |
+| Byte-preserving capture | BLOB storage, Base64 inspection, SHA-256 payload fingerprints |
+| Concurrent deduplication | Endpoint-scoped idempotency keys, unique constraints, atomic SQLite transactions |
+| Conflict detection | Reusing a key with different method, query, Content-Type, or payload returns `409` |
+| Controlled replay | Named HTTPS target allowlist, redirects disabled, bounded attempts, exponential backoff |
+| Delivery observability | Per-attempt status, error class, latency, timestamp, and aggregate statistics |
+| Credential boundaries | Separate admin key and hashed capture tokens; common credential headers redacted |
+| Async request handling | Streaming body limits and outbound responses; database work offloaded from the event loop |
+| Reproducible development | Pinned direct dependencies, mocked integration tests, GitHub Actions, non-root Docker |
+
+## Quick start
 
 ```sh
+git clone https://github.com/ozof70/webhook-lab.git
+cd webhook-lab
 cp .env.example .env
 python -c "import secrets; print(secrets.token_urlsafe(32))"
-# 將輸出的隨機值填入 .env 的 WEBHOOK_API_KEY。
-# 將 REPLAY_TARGETS 改為自己擁有的 HTTPS 測試服務；不需重送時填 {}。
+```
+
+Set `WEBHOOK_API_KEY` in `.env` to the generated value. Configure `REPLAY_TARGETS` with an HTTPS staging endpoint that you control, or use `{}` to disable replay destinations.
+
+```dotenv
+WEBHOOK_API_KEY=your-random-secret-at-least-32-characters
+REPLAY_TARGETS={"staging":"https://your-service.example/webhook"}
+```
+
+```sh
 docker compose up --build -d
 ```
 
-開啟 <http://localhost:8000/docs> 操作 API。管理路由展開後在 `x-api-key` 欄位輸入金鑰。健康檢查：`GET /health`。
+Open **http://localhost:8000/docs** for interactive API documentation. Enter the admin key in the `x-api-key` field of management operations. The service binds to loopback by default; events persist in a Docker volume.
 
-PowerShell 複製設定檔使用 `Copy-Item .env.example .env`。
+On PowerShell, copy the configuration with `Copy-Item .env.example .env`.
 
-## 本機開發
+## Try the complete workflow
 
-需要 Python 3.13。
+The following shell example uses `curl` and `jq`. Set `WEBHOOK_API_KEY` to the same value configured on the server.
+
+```sh
+BASE=http://localhost:8000
+
+# 1. Provision an isolated capture endpoint.
+ENDPOINT=$(curl -fsS "$BASE/api/endpoints" \
+  -H "X-API-Key: $WEBHOOK_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"payment-sandbox"}')
+CAPTURE_PATH=$(echo "$ENDPOINT" | jq -r .capture_path)
+CAPTURE_TOKEN=$(echo "$ENDPOINT" | jq -r .capture_token)
+
+# 2. Capture a payment event. Repeating this key and content returns the same event.
+EVENT=$(curl -fsS "$BASE$CAPTURE_PATH" \
+  -H "X-Webhook-Token: $CAPTURE_TOKEN" \
+  -H 'Idempotency-Key: payment-42' \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"payment.succeeded","amount":1200}')
+EVENT_ID=$(echo "$EVENT" | jq -r .id)
+
+# 3. Inspect the captured bytes, fingerprint, metadata, and delivery history.
+curl -fsS "$BASE/api/events/$EVENT_ID" \
+  -H "X-API-Key: $WEBHOOK_API_KEY" | jq
+
+# 4. Replay to the operator-configured staging destination.
+curl -fsS "$BASE/api/events/$EVENT_ID/replay" \
+  -H "X-API-Key: $WEBHOOK_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"target":"staging","attempts":3}' | jq
+
+# 5. Inspect capture volume and successful / failed delivery attempts.
+curl -fsS "$BASE/api/stats" -H "X-API-Key: $WEBHOOK_API_KEY" | jq
+```
+
+Capture response:
+
+```json
+{
+  "id": "8c060746-0a59-40e4-90eb-53ab689158b1",
+  "bytes": 42,
+  "sha256": "<64-character payload digest>",
+  "duplicate": false
+}
+```
+
+The digest and byte count above illustrate the response shape. Repeating a matching idempotent capture returns the original `id` with `duplicate: true`; the capture token is returned only when the endpoint is created.
+
+## API surface
+
+| Method | Path | Authentication | Purpose |
+| --- | --- | --- | --- |
+| GET | `/health` | None | Database readiness |
+| POST / GET | `/api/endpoints` | Admin key | Create / list capture endpoints |
+| POST / PUT / PATCH | `/hooks/{id}` | Capture token | Capture an event |
+| GET | `/api/events` | Admin key | Filter and paginate events |
+| GET | `/api/events/{id}` | Admin key | Inspect payload and delivery history |
+| GET | `/api/targets` | Admin key | List configured target names |
+| GET | `/api/stats` | Admin key | Capture and delivery aggregates |
+| POST | `/api/events/{id}/replay` | Admin key | Replay a captured event |
+
+Event listing supports `endpoint_id`, `limit` (1–100), and `offset`. Detailed bodies are Base64 encoded so non-UTF-8 payloads survive inspection intact.
+
+## Design decisions
+
+**Deduplication is transactional.** An optional `Idempotency-Key` (1–128 characters) is scoped to a capture endpoint. Key lookup and event insertion run inside `BEGIN IMMEDIATE`, backed by a composite primary key. Concurrent requests with the same key and fingerprint resolve to one event. Keys persist across restarts and currently do not expire. Without a key, each request creates a new event. Other headers are not part of the fingerprint; the first capture's metadata is retained.
+
+**Replay has explicit boundaries.** Replay preserves the original method, payload, `Content-Type`, and `Accept`, and adds `X-Webhook-Lab-Event`. It does not forward the original query string or other incoming headers. Destinations are fixed operator-configured HTTPS URLs, never caller-supplied arbitrary URLs. Redirects and environment proxies are disabled.
+
+**Retries expose side effects.** The default is one attempt. `attempts` includes the first delivery and is capped at three. Transport failures, HTTP 429, and HTTP 5xx retry after 0.5 and 1 second. Other responses stop the loop, including redirects and non-429 client errors. `Retry-After` is not interpreted. Receivers should deduplicate by `X-Webhook-Lab-Event` because a timeout can occur after the receiver processes an event.
+
+**Storage stays inspectable.** SQLite WAL stores endpoints, binary events, idempotency mappings, and delivery attempts. Statistics use one read transaction for a consistent snapshot. Blocking database operations in async routes run in the thread pool. This keeps the deployment small and the implementation straightforward to review.
+
+## Development
+
+Requires Python 3.13.
 
 ```sh
 python -m venv .venv
@@ -39,55 +136,39 @@ python -m venv .venv
 python -m pip install -r requirements-dev.txt
 ```
 
-設定環境變數後執行（本機模式不會自動讀取 `.env`）：
+Set the environment before starting the application. Local development does **not** automatically load `.env`.
 
 ```powershell
 $env:WEBHOOK_API_KEY = python -c "import secrets; print(secrets.token_urlsafe(32))"
-$env:REPLAY_TARGETS = '{"staging":"https://your-service.example/webhook"}'
+$env:REPLAY_TARGETS = '{}'
 python -m uvicorn app.main:create_app --factory --reload
 ```
 
-Linux/macOS 使用 `export WEBHOOK_API_KEY=...` 與 `export REPLAY_TARGETS='{}'`。
-
-## 操作範例（PowerShell）
-
-```powershell
-$auth = @{ 'X-API-Key' = $env:WEBHOOK_API_KEY }
-$endpoint = Invoke-RestMethod http://localhost:8000/api/endpoints -Method Post -Headers $auth -ContentType application/json -Body '{"name":"payment-test"}'
-$event = Invoke-RestMethod ("http://localhost:8000" + $endpoint.capture_path) -Method Post -Headers @{ 'X-Webhook-Token' = $endpoint.capture_token } -ContentType application/json -Body '{"type":"payment.succeeded","amount":1200}'
-Invoke-RestMethod http://localhost:8000/api/events -Headers $auth
-Invoke-RestMethod ("http://localhost:8000/api/events/" + $event.id) -Headers $auth
-Invoke-RestMethod ("http://localhost:8000/api/events/" + $event.id + "/replay") -Method Post -Headers $auth -ContentType application/json -Body '{"target":"staging","attempts":3}'
-```
-
-`capture_token` 只在建立時回傳，請妥善保存。此接收驗證需要發送方支援自訂 `X-Webhook-Token` 標頭。
-
-## API
-
-| 方法 | 路徑 | 用途 |
-| --- | --- | --- |
-| GET | `/health` | 資料庫連線檢查 |
-| POST / GET | `/api/endpoints` | 建立 / 列出端點 |
-| POST / PUT / PATCH | `/hooks/{id}` | 接收事件，使用端點 token |
-| GET | `/api/events?endpoint_id=...&limit=50&offset=0` | 分頁查詢 |
-| GET | `/api/events/{id}` | 內容與投遞紀錄 |
-| GET | `/api/targets` | 可用目的地名稱 |
-| POST | `/api/events/{id}/replay` | 重送事件 |
-
-## 重送語意與部署界線
-
-重送沿用原始方法、payload、Content-Type 與 Accept，加入 `X-Webhook-Lab-Event`；其餘標頭和原始 query 不轉送。目的地只由操作者在 `REPLAY_TARGETS` 設定固定 HTTPS URL，API 不接受任意 URL。不要設定不受信任的網域；正式部署應另以防火牆限制對內網及 metadata 服務的流量。
-
-預設只嘗試一次。`attempts` 表示包含首次的總嘗試次數；重試可能造成重複副作用，測試接收服務應以事件 ID 去重。429 與 5xx 使用 0.5、1 秒退避，目前不解析 Retry-After。
-
-這是單實例、內部除錯工具：重送在 HTTP 請求內執行，尚無耐久背景佇列、多租戶隔離、速率限制或自動清理。程序中斷可能留下未記錄的在途投遞；大量資料請自行安排備份與清理。原始 payload、query、自訂標頭可能包含敏感資料，常見驗證標頭遮蔽不等於完整去識別化。請先以測試資料使用；對外部署需 HTTPS、反向代理與流量限制。
-
-## 測試
+On Linux/macOS, use `export WEBHOOK_API_KEY=...` and `export REPLAY_TARGETS='{}'`.
 
 ```sh
 python -m pytest -q
 ```
 
-測試使用暫存資料庫和 HTTPX MockTransport，不會投遞到外部服務；涵蓋驗證、二進位內容、標頭遮蔽、大小上限、分頁、重試、錯誤稽核與重啟保存。
+Tests use temporary databases and HTTPX mock transports. They cover authentication, binary integrity, redaction, payload limits, pagination, retry decisions, network errors, delivery audits, persistence, concurrent deduplication, conflict handling, and statistics. No test delivers webhooks to external services.
 
-參考：[FastAPI 官方文件](https://fastapi.tiangolo.com/tutorial/)、[HTTPX transports](https://www.python-httpx.org/advanced/transports/)。
+## Deployment scope
+
+This version is an internal debugging service for a single instance. Replay runs inside the HTTP request; there is no durable background queue, multi-tenant isolation, automatic retention, or rate limiter. A process crash can leave an in-flight delivery without an audit row. Back up the database and plan storage retention before sustained use.
+
+The capture sender must support a custom `X-Webhook-Token` header. Provider-specific webhook signatures are not verified. SHA-256 is a content fingerprint, not proof of sender authenticity.
+
+Payloads, query strings, and custom headers can contain sensitive data. Redacting common credential headers is not complete anonymization. Externally accessible deployments need HTTPS, access controls, request timeouts, and traffic limits at the reverse proxy. Configure only trusted replay domains and enforce network egress rules to block private networks and cloud metadata endpoints; URL allowlisting alone does not prevent DNS rebinding.
+
+## Project map
+
+```text
+app/main.py                 Application factory, API routes, storage and replay policy
+tests/test_api.py           Integration, concurrency and failure-path tests
+.github/workflows/test.yml  CI test workflow
+Dockerfile                  Non-root Python runtime
+compose.yaml                Local service and persistent volume
+.env.example                Configuration template
+```
+
+Built on [FastAPI](https://fastapi.tiangolo.com/tutorial/) and [HTTPX](https://www.python-httpx.org/advanced/transports/).

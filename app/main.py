@@ -18,6 +18,7 @@ from uuid import uuid4
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 
 @dataclass
@@ -72,6 +73,11 @@ def create_app(settings: Settings | None = None, transport=None):
                     method TEXT NOT NULL, query TEXT NOT NULL, headers TEXT NOT NULL,
                     body BLOB NOT NULL, created_at TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS events_endpoint ON events(endpoint_id, created_at);
+                CREATE TABLE IF NOT EXISTS capture_keys (
+                    endpoint_id TEXT NOT NULL REFERENCES endpoints(id),
+                    key TEXT NOT NULL, fingerprint TEXT NOT NULL,
+                    event_id TEXT NOT NULL REFERENCES events(id),
+                    PRIMARY KEY (endpoint_id, key));
                 CREATE TABLE IF NOT EXISTS deliveries (
                     id TEXT PRIMARY KEY, event_id TEXT NOT NULL REFERENCES events(id),
                     target TEXT NOT NULL, attempt INTEGER NOT NULL, status INTEGER,
@@ -83,7 +89,7 @@ def create_app(settings: Settings | None = None, transport=None):
             app.state.client = client
             yield
 
-    app = FastAPI(title="Webhook Lab", version="1.0.0", lifespan=lifespan,
+    app = FastAPI(title="Webhook Lab", version="1.1.0", lifespan=lifespan,
                   description="Capture binary-safe webhook events, inspect them, and audit replays.")
 
     def authorize(x_api_key: str = Header(default="")):
@@ -111,6 +117,32 @@ def create_app(settings: Settings | None = None, transport=None):
             raise HTTPException(404, "Event not found")
         return found[0]
 
+    def persist_capture(endpoint_id: str, method: str, query: str, headers: list,
+                        body: bytes, key: str | None, fingerprint: str) -> tuple[str, bool]:
+        """Serialize key lookup and insertion so concurrent duplicates share one event."""
+        conn = db()
+        try:
+            with conn:
+                conn.execute("BEGIN IMMEDIATE")
+                if key is not None:
+                    existing = conn.execute(
+                        "SELECT event_id,fingerprint FROM capture_keys WHERE endpoint_id=? AND key=?",
+                        (endpoint_id, key),
+                    ).fetchone()
+                    if existing:
+                        if not hmac.compare_digest(existing["fingerprint"], fingerprint):
+                            raise HTTPException(409, "Idempotency key already used for different request content")
+                        return existing["event_id"], True
+                identifier = str(uuid4())
+                conn.execute("INSERT INTO events VALUES (?,?,?,?,?,?,?)",
+                             (identifier, endpoint_id, method, query, json.dumps(headers), body, now()))
+                if key is not None:
+                    conn.execute("INSERT INTO capture_keys VALUES (?,?,?,?)",
+                                 (endpoint_id, key, fingerprint, identifier))
+                return identifier, False
+        finally:
+            conn.close()
+
     @app.get("/health")
     def health():
         rows("SELECT 1")
@@ -129,8 +161,9 @@ def create_app(settings: Settings | None = None, transport=None):
         return rows("SELECT id,name,created_at FROM endpoints ORDER BY created_at DESC")
 
     @app.api_route("/hooks/{endpoint_id}", methods=["POST", "PUT", "PATCH"] , status_code=202)
-    async def capture(endpoint_id: str, request: Request, x_webhook_token: str = Header(default="")):
-        found = rows("SELECT token_hash FROM endpoints WHERE id=?", (endpoint_id,))
+    async def capture(endpoint_id: str, request: Request, x_webhook_token: str = Header(default=""),
+                      idempotency_key: str | None = Header(default=None, min_length=1, max_length=128)):
+        found = await run_in_threadpool(rows, "SELECT token_hash FROM endpoints WHERE id=?", (endpoint_id,))
         digest = hashlib.sha256(x_webhook_token.encode()).hexdigest()
         if not found or not hmac.compare_digest(found[0]["token_hash"], digest):
             raise HTTPException(404, "Endpoint not found")
@@ -142,10 +175,16 @@ def create_app(settings: Settings | None = None, transport=None):
         # Store credentials redacted; never replay incoming authentication or proxy headers.
         sensitive = {"authorization", "cookie", "x-api-key", "x-webhook-token", "proxy-authorization"}
         headers = [(k, "[REDACTED]" if k.lower() in sensitive else v) for k, v in request.headers.items()]
-        identifier = str(uuid4())
-        write("INSERT INTO events VALUES (?,?,?,?,?,?,?)",
-              (identifier, endpoint_id, request.method, request.url.query, json.dumps(headers), bytes(body), now()))
-        return {"id": identifier, "bytes": len(body)}
+        body_hash = hashlib.sha256(body).hexdigest()
+        fingerprint = hashlib.sha256(json.dumps(
+            [request.method, request.url.query, request.headers.get("content-type", ""), body_hash],
+            separators=(",", ":"),
+        ).encode()).hexdigest()
+        identifier, duplicate = await run_in_threadpool(
+            persist_capture, endpoint_id, request.method, request.url.query, headers,
+            bytes(body), idempotency_key, fingerprint,
+        )
+        return {"id": identifier, "bytes": len(body), "sha256": body_hash, "duplicate": duplicate}
 
     @app.get("/api/events", dependencies=[Depends(authorize)])
     def list_events(endpoint_id: str | None = None, limit: int = Query(50, ge=1, le=100),
@@ -157,6 +196,7 @@ def create_app(settings: Settings | None = None, transport=None):
     @app.get("/api/events/{event_id}", dependencies=[Depends(authorize)])
     def get_event(event_id: str):
         item = event(event_id)
+        item["sha256"] = hashlib.sha256(item["body"]).hexdigest()
         item["body_base64"] = base64.b64encode(item.pop("body")).decode()
         item["headers"] = json.loads(item["headers"])
         item["deliveries"] = rows("SELECT * FROM deliveries WHERE event_id=? ORDER BY created_at", (event_id,))
@@ -166,9 +206,28 @@ def create_app(settings: Settings | None = None, transport=None):
     def targets():
         return {"targets": list(cfg.targets)}
 
+    @app.get("/api/stats", dependencies=[Depends(authorize)])
+    def stats():
+        # One read transaction gives every aggregate the same database snapshot.
+        conn = db()
+        try:
+            conn.execute("BEGIN")
+            captured = conn.execute(
+                "SELECT count(*) AS events,coalesce(sum(length(body)),0) AS captured_bytes FROM events"
+            ).fetchone()
+            delivered = conn.execute("""
+                SELECT count(*) AS attempts,
+                    coalesce(sum(status BETWEEN 200 AND 299),0) AS successful,
+                    coalesce(sum(status IS NULL OR status < 200 OR status >= 300),0) AS failed,
+                    coalesce(avg(duration_ms),0) AS average_duration_ms FROM deliveries
+            """).fetchone()
+            return {"capture": dict(captured), "delivery": dict(delivered)}
+        finally:
+            conn.close()
+
     @app.post("/api/events/{event_id}/replay", dependencies=[Depends(authorize)])
     async def replay(event_id: str, data: ReplayInput):
-        item = event(event_id)
+        item = await run_in_threadpool(event, event_id)
         if data.target not in cfg.targets:
             raise HTTPException(422, "Unknown replay target; configure REPLAY_TARGETS")
         headers = {k: v for k, v in json.loads(item["headers"]) if k.lower() in {"content-type", "accept"}}
@@ -186,7 +245,7 @@ def create_app(settings: Settings | None = None, transport=None):
             delivery = {"id": str(uuid4()), "event_id": event_id, "target": data.target,
                         "attempt": attempt, "status": status, "error": error,
                         "duration_ms": int((time.monotonic()-start)*1000), "created_at": now()}
-            write("INSERT INTO deliveries VALUES (?,?,?,?,?,?,?,?)", tuple(delivery.values()))
+            await run_in_threadpool(write, "INSERT INTO deliveries VALUES (?,?,?,?,?,?,?,?)", tuple(delivery.values()))
             result.append(delivery)
             if status is not None and status != 429 and status < 500:
                 break

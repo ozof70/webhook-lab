@@ -1,4 +1,6 @@
 import base64
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import httpx
 import pytest
 from fastapi.testclient import TestClient
@@ -120,3 +122,90 @@ def test_configuration():
         create_app(Settings(api_key="short"))
     with pytest.raises(RuntimeError):
         create_app(Settings(api_key=KEY, targets={"bad": "http://localhost"}))
+
+
+def test_idempotent_capture_and_conflict(lab):
+    client, _, _ = lab
+    ep, _ = captured(client)
+    headers = {"X-Webhook-Token": ep["capture_token"], "Idempotency-Key": "payment-42"}
+    first = client.post(ep["capture_path"], headers=headers, content=b"paid").json()
+    second = client.post(ep["capture_path"], headers=headers, content=b"paid").json()
+    assert first["id"] == second["id"]
+    assert first["duplicate"] is False and second["duplicate"] is True
+    assert first["sha256"] == hashlib.sha256(b"paid").hexdigest()
+    conflict = client.post(ep["capture_path"], headers=headers, content=b"different")
+    assert conflict.status_code == 409
+    assert len(client.get("/api/events", headers=AUTH).json()) == 2
+
+
+def test_concurrent_duplicates_share_one_event(lab):
+    client, _, _ = lab
+    ep, _ = captured(client)
+    headers = {"X-Webhook-Token": ep["capture_token"], "Idempotency-Key": "concurrent"}
+
+    def send(_):
+        response = client.post(ep["capture_path"], headers=headers, content=b"same")
+        assert response.status_code == 202
+        return response.json()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(send, range(8)))
+    assert len({item["id"] for item in results}) == 1
+    assert sum(not item["duplicate"] for item in results) == 1
+    assert len(client.get("/api/events", headers=AUTH).json()) == 2
+
+
+def test_idempotency_keys_are_scoped_to_endpoint(lab):
+    client, _, _ = lab
+    endpoints = [captured(client)[0] for _ in range(2)]
+    results = [client.post(ep["capture_path"], content=b"payload", headers={
+        "X-Webhook-Token": ep["capture_token"], "Idempotency-Key": "shared"
+    }).json() for ep in endpoints]
+    assert results[0]["id"] != results[1]["id"]
+
+
+@pytest.mark.parametrize("change", ["method", "query", "content-type"])
+def test_idempotency_detects_request_metadata_changes(lab, change):
+    client, _, _ = lab
+    ep, _ = captured(client)
+    headers = {"X-Webhook-Token": ep["capture_token"], "Idempotency-Key": "metadata"}
+    client.post(ep["capture_path"], headers=headers, content=b"same")
+    method, path = "POST", ep["capture_path"]
+    if change == "method":
+        method = "PUT"
+    elif change == "query":
+        path += "?changed=1"
+    else:
+        headers["Content-Type"] = "application/json"
+    assert client.request(method, path, headers=headers, content=b"same").status_code == 409
+
+
+def test_stats_and_payload_fingerprint(lab):
+    client, _, statuses = lab
+    empty = client.get("/api/stats", headers=AUTH).json()
+    assert empty["capture"] == {"events": 0, "captured_bytes": 0}
+    assert empty["delivery"]["attempts"] == 0
+    _, identifier = captured(client, b"payload")
+    item = client.get(f"/api/events/{identifier}", headers=AUTH).json()
+    assert item["sha256"] == hashlib.sha256(b"payload").hexdigest()
+    statuses[:] = [503, 200]
+    client.post(f"/api/events/{identifier}/replay", headers=AUTH,
+                json={"target": "staging", "attempts": 2})
+    stats = client.get("/api/stats", headers=AUTH).json()
+    assert stats["capture"] == {"events": 1, "captured_bytes": 7}
+    assert stats["delivery"]["attempts"] == 2
+    assert stats["delivery"]["successful"] == 1
+    assert stats["delivery"]["failed"] == 1
+    assert client.get("/api/stats").status_code == 401
+
+
+def test_idempotency_survives_restart(tmp_path):
+    cfg = Settings(api_key=KEY, database=str(tmp_path / "db"))
+    with TestClient(create_app(cfg)) as client:
+        ep, _ = captured(client)
+        headers = {"X-Webhook-Token": ep["capture_token"], "Idempotency-Key": "persistent"}
+        first = client.post(ep["capture_path"], headers=headers, content=b"same").json()
+    with TestClient(create_app(cfg)) as client:
+        second = client.post(ep["capture_path"], headers=headers, content=b"same").json()
+        assert first["id"] == second["id"]
+        assert second["duplicate"] is True
